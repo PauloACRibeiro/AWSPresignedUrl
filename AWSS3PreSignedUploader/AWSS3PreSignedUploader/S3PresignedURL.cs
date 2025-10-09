@@ -47,7 +47,7 @@ namespace AWSS3PreSignedUploader
   // -------- Implementation --------
   public class PreSignerImpl : IPreSigner
   {
-    // Public parameterless constructor required by ODC
+    // Public parameterless constructor required by ODC..
     public PreSignerImpl() { }
 
     public string GetObjectPreSignedUrl(S3AuthInfo authInfo, string bucketName, string key, int durationInMinutes)
