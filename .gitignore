@@ -1,0 +1,14 @@
+.DS_Store
+
+# Ignore .NET build output
+**/bin/
+**/obj/
+
+# IDE-specific folders (common)
+.vs/
+.idea/
+
+# Binary distribution packages
+AWSS3PreSignedUploader/ODCPortal/20251006_AWSS3PreSignedUploader_linux-x64.zip
+AWSS3PreSignedUploader/ODCPortal/20251008_AWSS3PreSignedUploader_linux-x64.zip
+AWSS3PreSignedUploader/ODCPortal/AWSS3PreSignedUploader_linux-x64.zip
