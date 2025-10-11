@@ -47,7 +47,7 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Duration in minutes")] int durationInMinutes);
 
     [OSAction(Description = "Stream a binary from an ODC REST endpoint directly into a pre-signed S3 PUT URL")]
-    string UploadFromWebhookToPresignedUrl(
+    string UploadFromRestToPresignedUrl(
       [OSParameter(Description = "Source REST URL in the ODC app")] string sourceUrl,
       [OSParameter(Description = "Auth header name, e.g., Authorization or X-Webhook-Token")] string authHeaderName,
       [OSParameter(Description = "Auth header value, e.g., Bearer <token>")] string authHeaderValue,
@@ -89,7 +89,7 @@ namespace AWSS3PreSignedUploader
     }
 
     // NEW: Direct stream uploader to S3 from ODC REST endpoint 
-    public string UploadFromWebhookToPresignedUrl(
+    public string UploadFromRestToPresignedUrl(
       string sourceUrl,
       string authHeaderName,
       string authHeaderValue,
