@@ -1,9 +1,12 @@
 ﻿using System;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using OutSystems.ExternalLibraries.SDK;
 using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
-// -------- Initial version of the Library --------
+
+// -------- Version 1.1 of the Library --------
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
@@ -24,7 +27,7 @@ namespace AWSS3PreSignedUploader
   [OSInterface(
       Name = "AWSS3PreSignedUploader",
       IconResourceName = "AWSS3PreSignedUploader.resources.AWSS3PresignedUploader_lib.png",
-      Description = "Generate pre-signed URLs for S3 GET/PUT operations"
+      Description = "Generate pre-signed URLs for S3 GET/PUT operations, and stream files from ODC REST to S3"
   )]
   public interface IPreSigner
   {
@@ -42,13 +45,21 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Object key")] string key,
       [OSParameter(Description = "Content-Type for the upload")] string contentType,
       [OSParameter(Description = "Duration in minutes")] int durationInMinutes);
+
+    [OSAction(Description = "Stream a binary from an ODC REST endpoint directly into a pre-signed S3 PUT URL")]
+    string UploadFromWebhookToPresignedUrl(
+      [OSParameter(Description = "Source REST URL in the ODC app")] string sourceUrl,
+      [OSParameter(Description = "Auth header name, e.g., Authorization or X-Webhook-Token")] string authHeaderName,
+      [OSParameter(Description = "Auth header value, e.g., Bearer <token>")] string authHeaderValue,
+      [OSParameter(Description = "Pre-signed S3 PUT URL (single-part)")] string presignedPutUrl,
+      [OSParameter(Description = "Content-Type to enforce on PUT (must match the presign)")] string contentType,
+      [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
   }
 
   // -------- Implementation --------
   public class PreSignerImpl : IPreSigner
   {
-    // Public parameterless constructor required by ODC..
-    public PreSignerImpl() { }
+    public PreSignerImpl() { } // required by ODC
 
     public string GetObjectPreSignedUrl(S3AuthInfo authInfo, string bucketName, string key, int durationInMinutes)
     {
@@ -77,14 +88,60 @@ namespace AWSS3PreSignedUploader
       return s3.GetPreSignedURL(req);
     }
 
+    // NEW: Direct stream uploader to S3 from ODC REST endpoint 
+    public string UploadFromWebhookToPresignedUrl(
+      string sourceUrl,
+      string authHeaderName,
+      string authHeaderValue,
+      string presignedPutUrl,
+      string contentType,
+      int timeoutSeconds)
+    {
+      if (string.IsNullOrWhiteSpace(sourceUrl))        throw new ArgumentException("sourceUrl is required.");
+      if (string.IsNullOrWhiteSpace(presignedPutUrl))  throw new ArgumentException("presignedPutUrl is required.");
+      if (timeoutSeconds <= 0) timeoutSeconds = 300;
+
+      using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
+      { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+
+      // 1) Open a streaming GET to the source ODC REST endpoint
+      using var getReq = new HttpRequestMessage(HttpMethod.Get, sourceUrl);
+      if (!string.IsNullOrWhiteSpace(authHeaderName) && !string.IsNullOrWhiteSpace(authHeaderValue))
+        getReq.Headers.TryAddWithoutValidation(authHeaderName, authHeaderValue);
+
+      using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
+      getResp.EnsureSuccessStatusCode();
+
+      var srcStream = getResp.Content.ReadAsStream();
+
+      // 2) Stream directly into S3 PUT using the pre-signed URL(pre-signed single-part)
+      using var putReq = new HttpRequestMessage(HttpMethod.Put, presignedPutUrl)
+      {
+        Content = new StreamContent(srcStream)
+      };
+      if (!string.IsNullOrWhiteSpace(contentType))
+        putReq.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+
+      // Avoid the 100-continue round trip; keep headers small, 
+      // saves a round trip, which matters when you already know the upload will be accepted
+      putReq.Headers.ExpectContinue = false;
+
+      using var putResp = http.Send(putReq, HttpCompletionOption.ResponseHeadersRead);
+      putResp.EnsureSuccessStatusCode();
+
+      // S3 returns ETag header for a successful single-part PUT
+      var etag = putResp.Headers.ETag?.Tag?.Trim('"') ?? string.Empty;
+      return etag;
+    }
+
     private static void Validate(S3AuthInfo auth, string bucket, string key, int mins)
     {
-      if (string.IsNullOrWhiteSpace(auth.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
-      if (string.IsNullOrWhiteSpace(auth.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
-      if (string.IsNullOrWhiteSpace(auth.Region)) throw new ArgumentException("Region is required.");
-      if (string.IsNullOrWhiteSpace(bucket)) throw new ArgumentException("BucketName is required.");
-      if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Key is required.");
-      if (mins <= 0 || mins > 10080) throw new ArgumentOutOfRangeException(nameof(mins), "DurationInMinutes must be 1–10080.");
+      if (string.IsNullOrWhiteSpace(auth.AccessKeyId))    throw new ArgumentException("AccessKeyId is required.");
+      if (string.IsNullOrWhiteSpace(auth.SecretAccessKey))throw new ArgumentException("SecretAccessKey is required.");
+      if (string.IsNullOrWhiteSpace(auth.Region))         throw new ArgumentException("Region is required.");
+      if (string.IsNullOrWhiteSpace(bucket))              throw new ArgumentException("bucketName is required.");
+      if (string.IsNullOrWhiteSpace(key))                 throw new ArgumentException("key is required.");
+      if (mins <= 0 || mins > 10080)                      throw new ArgumentOutOfRangeException(nameof(mins), "durationInMinutes must be 1–10080.");
     }
 
     private static AmazonS3Client CreateClient(S3AuthInfo auth)
