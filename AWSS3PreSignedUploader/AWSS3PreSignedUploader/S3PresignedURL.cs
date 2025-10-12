@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using OutSystems.ExternalLibraries.SDK;
@@ -6,7 +7,7 @@ using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
 
-// -------- Version 1.1 of the Library --------
+// -------- Version 1.1.3 of the Library --------
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
@@ -49,6 +50,7 @@ namespace AWSS3PreSignedUploader
     [OSAction(Description = "Stream a binary from an ODC REST endpoint directly into a pre-signed S3 PUT URL")]
     string UploadFromRestToPresignedUrl(
       [OSParameter(Description = "Source REST URL in the ODC app")] string sourceUrl,
+      [OSParameter(Description = "GUID identifying the correct binary file in the ODC REST endpoint")] string binGuid,
       [OSParameter(Description = "Auth header name, e.g., Authorization or X-Webhook-Token")] string authHeaderName,
       [OSParameter(Description = "Auth header value, e.g., Bearer <token>")] string authHeaderValue,
       [OSParameter(Description = "Pre-signed S3 PUT URL (single-part)")] string presignedPutUrl,
@@ -91,6 +93,7 @@ namespace AWSS3PreSignedUploader
     // NEW: Direct stream uploader to S3 from ODC REST endpoint 
     public string UploadFromRestToPresignedUrl(
       string sourceUrl,
+      string binGuid,
       string authHeaderName,
       string authHeaderValue,
       string presignedPutUrl,
@@ -98,6 +101,7 @@ namespace AWSS3PreSignedUploader
       int timeoutSeconds)
     {
       if (string.IsNullOrWhiteSpace(sourceUrl))        throw new ArgumentException("sourceUrl is required.");
+      if (string.IsNullOrWhiteSpace(binGuid))          throw new ArgumentException("binGuid is required.");
       if (string.IsNullOrWhiteSpace(presignedPutUrl))  throw new ArgumentException("presignedPutUrl is required.");
       if (timeoutSeconds <= 0) timeoutSeconds = 300;
 
@@ -105,7 +109,8 @@ namespace AWSS3PreSignedUploader
       { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
       // 1) Open a streaming GET to the source ODC REST endpoint
-      using var getReq = new HttpRequestMessage(HttpMethod.Get, sourceUrl);
+      var resolvedSourceUrl = AppendQueryParameter(sourceUrl, "binGuid", binGuid);
+      using var getReq = new HttpRequestMessage(HttpMethod.Get, resolvedSourceUrl);
       if (!string.IsNullOrWhiteSpace(authHeaderName) && !string.IsNullOrWhiteSpace(authHeaderValue))
         getReq.Headers.TryAddWithoutValidation(authHeaderName, authHeaderValue);
 
@@ -113,11 +118,29 @@ namespace AWSS3PreSignedUploader
       getResp.EnsureSuccessStatusCode();
 
       var srcStream = getResp.Content.ReadAsStream();
+      var upstreamLength = getResp.Content.Headers.ContentLength;
+
+      HttpContent putContent;
+      if (upstreamLength.HasValue)
+      {
+        putContent = new StreamContent(srcStream);
+        putContent.Headers.ContentLength = upstreamLength.Value;
+      }
+      else
+      {
+        var buffered = new MemoryStream();
+        srcStream.CopyTo(buffered);
+        buffered.Position = 0;
+        srcStream.Dispose();
+
+        putContent = new StreamContent(buffered);
+        putContent.Headers.ContentLength = buffered.Length;
+      }
 
       // 2) Stream directly into S3 PUT using the pre-signed URL(pre-signed single-part)
       using var putReq = new HttpRequestMessage(HttpMethod.Put, presignedPutUrl)
       {
-        Content = new StreamContent(srcStream)
+        Content = putContent
       };
       if (!string.IsNullOrWhiteSpace(contentType))
         putReq.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
@@ -132,6 +155,17 @@ namespace AWSS3PreSignedUploader
       // S3 returns ETag header for a successful single-part PUT
       var etag = putResp.Headers.ETag?.Tag?.Trim('"') ?? string.Empty;
       return etag;
+    }
+
+    private static string AppendQueryParameter(string url, string parameterName, string parameterValue)
+    {
+      if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("URL cannot be empty.", nameof(url));
+      var trimmed = url.Trim();
+      var hasQuery = trimmed.Contains('?');
+      var needsAmpersand = hasQuery && !trimmed.EndsWith("?") && !trimmed.EndsWith("&");
+
+      var prefix = hasQuery ? (needsAmpersand ? "&" : string.Empty) : "?";
+      return $"{trimmed}{prefix}{Uri.EscapeDataString(parameterName)}={Uri.EscapeDataString(parameterValue ?? string.Empty)}";
     }
 
     private static void Validate(S3AuthInfo auth, string bucket, string key, int mins)
