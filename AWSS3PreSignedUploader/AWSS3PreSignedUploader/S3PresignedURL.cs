@@ -51,20 +51,20 @@ namespace AWSS3PreSignedUploader
     string UploadFromRestToPresignedUrl(
       [OSParameter(Description = "Source REST URL in the ODC app")] string sourceUrl,
       [OSParameter(Description = "GUID identifying the correct binary file in the ODC REST endpoint")] string binGuid,
-      [OSParameter(Description = "Auth header name (e.g., Authorization)")] string authHeaderName,
-      [OSParameter(Description = "Auth header value (e.g., Bearer <token>)")] string authHeaderValue,
+      [OSParameter(Description = "Auth header name for Source(e.g., Authorization)")] string authHeaderName,
+      [OSParameter(Description = "Auth header value for Source (e.g., Bearer <token>)")] string authHeaderValue,
       [OSParameter(Description = "Pre-signed S3 PUT URL (single-part)")] string presignedPutUrl,
       [OSParameter(Description = "Content-Type to enforce on PUT (must match the presign)")] string contentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
 
-    // NEW: S3 -> ODC (download from S3 via presigned GET into an ODC REST sink)
-    [OSAction(Description = "Download from S3 (pre-signed GET) and POST the stream into an ODC REST sink URL")]
+    // NEW: S3 -> ODC (download from S3 via presigned GET into an ODC REST Target)
+    [OSAction(Description = "Download from S3 (pre-signed GET) and POST the stream into an ODC REST Target URL")]
     string DownloadFromPresignedUrlToRest(
-      [OSParameter(Description = "S3 pre-signed GET URL")] string presignedGetUrl,
-      [OSParameter(Description = "ODC REST sink URL (POST binary)")] string sinkUrl,
-      [OSParameter(Description = "Auth header name for sink (e.g., Authorization)")] string sinkAuthHeaderName,
-      [OSParameter(Description = "Auth header value for sink")] string sinkAuthHeaderValue,
-      [OSParameter(Description = "Override Content-Type sent to sink (optional)")] string sinkContentType,
+      [OSParameter(Description = "Target ODC REST URL (POST binary)")] string targetUrl,
+      [OSParameter(Description = "Auth header name for Target (e.g., Authorization)")] string targetAuthHeaderName,
+      [OSParameter(Description = "Auth header value for Target")] string targetAuthHeaderValue,
+      [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
+      [OSParameter(Description = "Override Content-Type sent to target (optional)")] string targetContentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
   }
 
@@ -166,17 +166,17 @@ namespace AWSS3PreSignedUploader
       return etag;
     }
 
-    // NEW: pre-signed GET (S3) -> POST binary to ODC REST sink
+    // NEW: pre-signed GET (S3) -> POST binary to ODC REST target
     public string DownloadFromPresignedUrlToRest(
       string presignedGetUrl,
-      string sinkUrl,
-      string sinkAuthHeaderName,
-      string sinkAuthHeaderValue,
-      string sinkContentType,
+      string targetUrl,
+      string targetAuthHeaderName,
+      string targetAuthHeaderValue,
+      string targetContentType,
       int timeoutSeconds)
     {
       if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
-      if (string.IsNullOrWhiteSpace(sinkUrl))         throw new ArgumentException("sinkUrl is required.");
+      if (string.IsNullOrWhiteSpace(targetUrl))         throw new ArgumentException("targetUrl is required.");
       if (timeoutSeconds <= 0) timeoutSeconds = 300;
 
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
@@ -191,29 +191,29 @@ namespace AWSS3PreSignedUploader
       var sourceContentType = getResp.Content.Headers.ContentType?.MediaType;
       var sourceLength = getResp.Content.Headers.ContentLength;
 
-      // 2) POST directly into ODC REST sink (streaming)
-      using var postReq = new HttpRequestMessage(HttpMethod.Post, sinkUrl) {
+      // 2) POST directly into ODC REST target (streaming)
+      using var postReq = new HttpRequestMessage(HttpMethod.Post, targetUrl) {
         Content = new StreamContent(srcStream)
       };
 
       // Prefer explicit content-type if provided; otherwise propagate S3's content-type if available
-      var effectiveContentType = !string.IsNullOrWhiteSpace(sinkContentType) ? sinkContentType : (sourceContentType ?? "application/octet-stream");
+      var effectiveContentType = !string.IsNullOrWhiteSpace(targetContentType) ? targetContentType : (sourceContentType ?? "application/octet-stream");
       postReq.Content.Headers.ContentType = new MediaTypeHeaderValue(effectiveContentType);
 
       if (sourceLength.HasValue)
         postReq.Content.Headers.ContentLength = sourceLength.Value; // if known, set it (faster on some gateways)
 
-      if (!string.IsNullOrWhiteSpace(sinkAuthHeaderName) && !string.IsNullOrWhiteSpace(sinkAuthHeaderValue))
-        postReq.Headers.TryAddWithoutValidation(sinkAuthHeaderName, sinkAuthHeaderValue);
+      if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
+        postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
 
       postReq.Headers.ExpectContinue = false;
 
       using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
       postResp.EnsureSuccessStatusCode();
 
-      // Return sink response info (status + optional ETag/ID if provided by your API)
-      var sinkEtag = postResp.Headers.ETag?.Tag?.Trim('"');
-      return sinkEtag ?? $"OK:{(int)postResp.StatusCode}";
+      // Return target response info (status + optional ETag/ID if provided by your API)
+      var targetEtag = postResp.Headers.ETag?.Tag?.Trim('"');
+      return targetEtag ?? $"OK:{(int)postResp.StatusCode}";
     }
 
     private static string AppendQueryParameter(string url, string name, string value)
