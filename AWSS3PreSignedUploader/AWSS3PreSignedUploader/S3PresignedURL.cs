@@ -28,7 +28,7 @@ namespace AWSS3PreSignedUploader
   [OSInterface(
       Name = "AWSS3PreSignedUploader",
       IconResourceName = "AWSS3PreSignedUploader.resources.AWSS3PresignedUploader_lib.png",
-      Description = "Generate pre-signed URLs for S3 GET/PUT; stream files between ODC REST and S3"
+      Description = "Generate pre-signed URLs for S3 GET/PUT operations, and stream files between ODC REST and S3"
   )]
   public interface IPreSigner
   {
@@ -50,11 +50,11 @@ namespace AWSS3PreSignedUploader
     [OSAction(Description = "Stream a binary from an ODC REST endpoint directly into a pre-signed S3 PUT URL")]
     string UploadFromRestToPresignedUrl(
       [OSParameter(Description = "Source REST URL in the ODC app")] string sourceUrl,
-      [OSParameter(Description = "GUID identifying the correct binary in the source REST")] string binGuid,
+      [OSParameter(Description = "GUID identifying the correct binary file in the ODC REST endpoint")] string binGuid,
       [OSParameter(Description = "Auth header name (e.g., Authorization)")] string authHeaderName,
       [OSParameter(Description = "Auth header value (e.g., Bearer <token>)")] string authHeaderValue,
       [OSParameter(Description = "Pre-signed S3 PUT URL (single-part)")] string presignedPutUrl,
-      [OSParameter(Description = "Content-Type to enforce on PUT")] string contentType,
+      [OSParameter(Description = "Content-Type to enforce on PUT (must match the presign)")] string contentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
 
     // NEW: S3 -> ODC (download from S3 via presigned GET into an ODC REST sink)
