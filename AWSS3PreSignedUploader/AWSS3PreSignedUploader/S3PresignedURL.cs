@@ -1,13 +1,15 @@
 ﻿using System;
 using System.IO;
 using System.Net.Http;
+using System.Linq;
+using System.Text.Json;
 using System.Net.Http.Headers;
 using OutSystems.ExternalLibraries.SDK;
 using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
 
-// -------- Version 1.2.0 of the Library --------
+// -------- Version 1.2.1 of the Library --------
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
@@ -23,7 +25,18 @@ namespace AWSS3PreSignedUploader
     [OSStructureField(Description = "Region name, e.g., eu-central-1")]
     public string Region { get; set; }
   }
+  [OSStructure(Description = "Result of downloading from S3 into ODC REST")]
+  public struct DownloadToRestResult
+  {
+    [OSStructureField(Description = "ID of the inserted DB record returned by the ODC REST")]
+    public string BinGuid { get; set; }
 
+    [OSStructureField(Description = "True if the ODC REST reported success")]
+    public bool Success { get; set; }
+
+    [OSStructureField(Description = "Error message from the ODC REST (if any)")]
+    public string ErrorMessage { get; set; }
+  }
   // -------- Interface  -------- (added icon support below in folder resources ..)
   [OSInterface(
       Name = "AWSS3PreSignedUploader",
@@ -47,7 +60,7 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Content-Type for the upload")] string contentType,
       [OSParameter(Description = "Duration in minutes")] int durationInMinutes);
 
-    [OSAction(Description = "Stream a binary from an ODC REST endpoint directly into a pre-signed S3 PUT URL")]
+    [OSAction(Description = "Upload to S3 using a pre-signed PUT URL by streaming a binary from an ODC REST Source URL directly to S3")]
     string UploadFromRestToPresignedUrl(
       [OSParameter(Description = "Source REST URL in the ODC app")] string sourceUrl,
       [OSParameter(Description = "GUID identifying the correct binary file in the ODC REST endpoint")] string binGuid,
@@ -58,13 +71,14 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
 
     // NEW: S3 -> ODC (download from S3 via presigned GET into an ODC REST Target)
-    [OSAction(Description = "Download from S3 (pre-signed GET) and POST the stream into an ODC REST Target URL")]
-    string DownloadFromPresignedUrlToRest(
-      [OSParameter(Description = "Target ODC REST URL (POST binary)")] string targetUrl,
-      [OSParameter(Description = "Auth header name for Target (e.g., Authorization)")] string targetAuthHeaderName,
-      [OSParameter(Description = "Auth header value for Target")] string targetAuthHeaderValue,
+    [OSAction(Description = "Download from S3 (pre-signed GET) and POST the stream into an ODC REST target (with ?Key=...)")]
+    DownloadToRestResult DownloadFromPresignedUrlToRest(
       [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
-      [OSParameter(Description = "Override Content-Type sent to target (optional)")] string targetContentType,
+      [OSParameter(Description = "Target ODC REST base URL (receives the binary via POST)")] string targetUrl,
+      [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
+      [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
+      [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
+      [OSParameter(Description = "Content-Type to send to target (optional; if empty, propagate S3's)")] string targetContentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
   }
 
@@ -99,7 +113,7 @@ namespace AWSS3PreSignedUploader
       };
       return s3.GetPreSignedURL(req);
     }
-// NEW: Direct stream uploader to S3 from ODC REST endpoint     
+    // NEW: Direct stream uploader to S3 from ODC REST endpoint     
     public string UploadFromRestToPresignedUrl(
       string sourceUrl,
       string binGuid,
@@ -167,41 +181,46 @@ namespace AWSS3PreSignedUploader
     }
 
     // NEW: pre-signed GET (S3) -> POST binary to ODC REST target
-    public string DownloadFromPresignedUrlToRest(
+    public DownloadToRestResult DownloadFromPresignedUrlToRest(
       string presignedGetUrl,
       string targetUrl,
+      string s3ObjectKey,
       string targetAuthHeaderName,
       string targetAuthHeaderValue,
       string targetContentType,
       int timeoutSeconds)
     {
       if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
-      if (string.IsNullOrWhiteSpace(targetUrl))         throw new ArgumentException("targetUrl is required.");
+      if (string.IsNullOrWhiteSpace(targetUrl))       throw new ArgumentException("targetUrl is required.");
+      if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
       if (timeoutSeconds <= 0) timeoutSeconds = 300;
 
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
       { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
-      // 1) Open streaming GET from S3 pre-signed URL
+      // 1) GET from S3 (streaming)
       using var getReq = new HttpRequestMessage(HttpMethod.Get, presignedGetUrl);
       using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
       getResp.EnsureSuccessStatusCode();
 
-      var srcStream = getResp.Content.ReadAsStream();
+      var srcStream         = getResp.Content.ReadAsStream();
       var sourceContentType = getResp.Content.Headers.ContentType?.MediaType;
-      var sourceLength = getResp.Content.Headers.ContentLength;
+      var sourceLength      = getResp.Content.Headers.ContentLength;
 
-      // 2) POST directly into ODC REST target (streaming)
-      using var postReq = new HttpRequestMessage(HttpMethod.Post, targetUrl) {
+      // 2) Build target URL with ?Key=<s3ObjectKey>
+      var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
+
+      // 3) POST to ODC target (streaming)
+      using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) {
         Content = new StreamContent(srcStream)
       };
 
-      // Prefer explicit content-type if provided; otherwise propagate S3's content-type if available
-      var effectiveContentType = !string.IsNullOrWhiteSpace(targetContentType) ? targetContentType : (sourceContentType ?? "application/octet-stream");
-      postReq.Content.Headers.ContentType = new MediaTypeHeaderValue(effectiveContentType);
+      var effectiveContentType = !string.IsNullOrWhiteSpace(targetContentType)
+          ? targetContentType
+          : (sourceContentType ?? "application/octet-stream");
 
-      if (sourceLength.HasValue)
-        postReq.Content.Headers.ContentLength = sourceLength.Value; // if known, set it (faster on some gateways)
+      postReq.Content.Headers.ContentType = new MediaTypeHeaderValue(effectiveContentType);
+      if (sourceLength.HasValue) postReq.Content.Headers.ContentLength = sourceLength.Value;
 
       if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
         postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
@@ -209,13 +228,68 @@ namespace AWSS3PreSignedUploader
       postReq.Headers.ExpectContinue = false;
 
       using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
-      postResp.EnsureSuccessStatusCode();
+      // We read headers/body regardless of status to surface errors cleanly
+      var successHeader = GetHeaderValue(postResp, "success");
+      var errorHeader   = GetHeaderValue(postResp, "errorMessage");
 
-      // Return target response info (status + optional ETag/ID if provided by your API)
-      var targetEtag = postResp.Headers.ETag?.Tag?.Trim('"');
-      return targetEtag ?? $"OK:{(int)postResp.StatusCode}";
+      string body = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
+
+      // Try to parse binGUID from body (accept plain text or {"binGUID":"..."} JSON)
+      var binGuid = ExtractBinGuidFromBody(body);
+
+      // If HTTP not successful, ensure Success=false and preserve error message
+      var httpOk = postResp.IsSuccessStatusCode;
+
+      bool success = ParseBool(successHeader ?? string.Empty) && httpOk;
+      string errorMessage = errorHeader ?? string.Empty;
+      if (!httpOk && string.IsNullOrWhiteSpace(errorMessage))
+        errorMessage = $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
+
+      return new DownloadToRestResult {
+        BinGuid = binGuid,
+        Success = success,
+        ErrorMessage = errorMessage ?? string.Empty
+      };
     }
 
+    // --- helpers ---
+    private static string? GetHeaderValue(HttpResponseMessage resp, string headerName)
+    {
+      if (resp.Headers.TryGetValues(headerName, out var values))
+        return values.FirstOrDefault();
+      if (resp.Content?.Headers != null && resp.Content.Headers.TryGetValues(headerName, out var v2))
+        return v2.FirstOrDefault();
+      return null;
+    }
+
+    private static bool ParseBool(string value)
+    {
+      if (string.IsNullOrWhiteSpace(value)) return false;
+      return value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("1")    || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ExtractBinGuidFromBody(string body)
+    {
+      if (string.IsNullOrWhiteSpace(body)) return string.Empty;
+      var trimmed = body.Trim().Trim('"');
+
+      // Try JSON: {"binGUID":"..."} (case-insensitive)
+      if (trimmed.StartsWith("{") && trimmed.EndsWith("}"))
+      {
+        try
+        {
+          using var doc = JsonDocument.Parse(trimmed);
+          var root = doc.RootElement;
+          if (root.TryGetProperty("binGUID", out var v)) return v.GetString() ?? string.Empty;
+          if (root.TryGetProperty("binguid", out var v2)) return v2.GetString() ?? string.Empty;
+        }
+        catch { /* fall back to plain text */ }
+      }
+
+      // Assume plain text body contains the GUID
+      return trimmed;
+    }
     private static string AppendQueryParameter(string url, string name, string value)
     {
       if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("URL cannot be empty.", nameof(url));
