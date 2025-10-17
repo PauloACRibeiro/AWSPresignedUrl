@@ -4,6 +4,8 @@ using System.Net.Http;
 using System.Linq;
 using System.Text.Json;
 using System.Net.Http.Headers;
+using System.Buffers;
+using System.Security.Cryptography;
 using OutSystems.ExternalLibraries.SDK;
 using Amazon;
 using Amazon.S3;
@@ -80,6 +82,17 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
       [OSParameter(Description = "Content-Type to send to target (optional; if empty, propagate S3's)")] string targetContentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
+
+     [OSAction(Description = "Chunked: download from S3 (pre-signed GET) and POST in parts to an ODC REST target (?Key=...) to bypass 30MB limit")]
+    DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
+      [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
+      [OSParameter(Description = "Target ODC REST base URL (receives binary via POST)")] string targetUrl,
+      [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
+      [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
+      [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
+      [OSParameter(Description = "Content-Type to send (optional; if empty, propagate S3's)")] string targetContentType,
+      [OSParameter(Description = "Chunk size in bytes (default 8,388,608 = 8MB)")] int chunkSizeBytes,
+      [OSParameter(Description = "Timeout per chunk request in seconds (default 120)")] int timeoutSeconds); 
   }
 
   // -------- Implementation --------
@@ -252,6 +265,151 @@ namespace AWSS3PreSignedUploader
       };
     }
 
+    public DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
+      string presignedGetUrl,
+      string targetUrl,
+      string s3ObjectKey,
+      string targetAuthHeaderName,
+      string targetAuthHeaderValue,
+      string targetContentType,
+      int chunkSizeBytes,
+      int timeoutSeconds)
+    {
+      if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
+      if (string.IsNullOrWhiteSpace(targetUrl))       throw new ArgumentException("targetUrl is required.");
+      if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
+
+      if (chunkSizeBytes <= 0 || chunkSizeBytes > 25_000_000) // keep headroom under 30MB
+        chunkSizeBytes = 8 * 1024 * 1024; // 8MB
+      if (timeoutSeconds <= 0) timeoutSeconds = 120;
+
+      using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
+      { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+
+      // 1) Open streaming GET from S3
+      using var getReq = new HttpRequestMessage(HttpMethod.Get, presignedGetUrl);
+      using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
+      getResp.EnsureSuccessStatusCode();
+
+      var srcStream         = getResp.Content.ReadAsStream();
+      var sourceContentType = getResp.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
+      var sourceLength      = getResp.Content.Headers.ContentLength;
+
+      // 2) Build target URL with ?Key=
+      var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
+
+      // 3) Prepare chunk loop
+      var uploadId = Guid.NewGuid().ToString("N");
+      var buffer   = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
+      try
+      {
+        long totalRead = 0;
+        int  index     = 0;
+        int? totalChunks = null;
+
+        if (sourceLength.HasValue)
+        {
+          var chunks = (int)(sourceLength.Value / chunkSizeBytes);
+          if (sourceLength.Value % chunkSizeBytes != 0) chunks++;
+          totalChunks = Math.Max(chunks, 1);
+        }
+
+        DownloadToRestResult finalResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "" };
+
+        for (;; index++)
+        {
+          int read = ReadFull(srcStream, buffer, 0, chunkSizeBytes);
+          if (read <= 0) break; // EOF
+
+          bool isLast = false;
+          totalRead += read;
+          if (!sourceLength.HasValue)
+          {
+            // for unknown length, we only know last when we hit EOF on next read
+            // but since we can't preread without buffering, we set last when next read == 0
+            // solution: peek 1 byte with Positionable streams; here we will assume last when read < chunkSize
+            isLast = read < chunkSizeBytes;
+          }
+          else
+          {
+            isLast = (totalRead >= sourceLength.Value);
+          }
+
+          using var content = new ByteArrayContent(buffer.AsSpan(0, read).ToArray());
+          content.Headers.ContentType = new MediaTypeHeaderValue(
+            string.IsNullOrWhiteSpace(targetContentType) ? sourceContentType : targetContentType
+          );
+          content.Headers.ContentLength = read;
+
+          using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) { Content = content };
+
+          // Chunk headers for the target to assemble
+          postReq.Headers.TryAddWithoutValidation("X-Upload-Id",  uploadId);
+          postReq.Headers.TryAddWithoutValidation("X-Chunk-Index", index.ToString());
+          if (totalChunks.HasValue) postReq.Headers.TryAddWithoutValidation("X-Chunk-Total", totalChunks.Value.ToString());
+          if (isLast)               postReq.Headers.TryAddWithoutValidation("X-Last-Chunk", "true");
+
+          // Auth header
+          if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
+            postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
+
+          postReq.Headers.ExpectContinue = false;
+
+          using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
+          // For intermediate chunks we accept 2xx without reading/returning anything special
+          var ok = postResp.IsSuccessStatusCode;
+          if (!ok)
+          {
+            var error = GetHeaderValue(postResp, "errorMessage")
+                        ?? $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
+            return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = error };
+          }
+
+          if (isLast)
+          {
+            // Final chunk expected to return headers + body we defined
+            var successHeader = GetHeaderValue(postResp, "success");
+            var errorHeader   = GetHeaderValue(postResp, "errorMessage");
+            var body          = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
+            var binGuid       = ExtractBinGuidFromBody(body);
+
+            bool success = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
+            string errorMessage = errorHeader ?? (success ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
+
+            finalResult = new DownloadToRestResult {
+              BinGuid = binGuid,
+              Success = success,
+              ErrorMessage = errorMessage
+            };
+            return finalResult;
+          }
+
+          // continue loop for next chunk
+        }
+
+        // If we reached here without last chunk being sent (e.g., zero-length)
+        return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "No data read from source." };
+      }
+      finally
+      {
+        ArrayPool<byte>.Shared.Return(buffer);
+      }
+    }
+
+    // Read up to count bytes, return actual read (0 means EOF)
+    // Fills the buffer as much as possible but does not block for a full chunk if stream ends earlier.
+    private static int ReadFull(Stream s, byte[] buffer, int offset, int count)
+    {
+      int total = 0;
+      while (total < count)
+      {
+        int n = s.Read(buffer, offset + total, count - total);
+        if (n <= 0) break;
+        total += n;
+        if (n == 0) break;
+      }
+      return total;
+    }
     // --- helpers ---
     private static string? GetHeaderValue(HttpResponseMessage resp, string headerName)
     {
