@@ -1,20 +1,22 @@
 ﻿using System;
-using System.IO;
-using System.Net.Http;
-using System.Linq;
 using System.Buffers;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
-using System.Security.Cryptography;
 using OutSystems.ExternalLibraries.SDK;
 using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
 
-// -------- Version 1.2.4 of the Library --------
+//
+// -------- Version 1.2.5 of the Library --------
+// - A) Pre-fetch total content length via HEAD (fallback 1-byte Range GET) and ALWAYS send X-Chunk-Total
+// - B) Force a single Content-Type for every chunk (either provided or application/octet-stream)
+//
+
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
@@ -30,6 +32,7 @@ namespace AWSS3PreSignedUploader
     [OSStructureField(Description = "Region name, e.g., eu-central-1")]
     public string Region { get; set; }
   }
+
   [OSStructure(Description = "Result of downloading from S3 into ODC REST")]
   public struct DownloadToRestResult
   {
@@ -42,7 +45,8 @@ namespace AWSS3PreSignedUploader
     [OSStructureField(Description = "Error message from the ODC REST (if any)")]
     public string ErrorMessage { get; set; }
   }
-  // -------- Interface  -------- (added icon support below in folder resources ..)
+
+  // -------- Interface (icon in resources folder) --------
   [OSInterface(
       Name = "AWSS3PreSignedUploader",
       IconResourceName = "AWSS3PreSignedUploader.resources.AWSS3PresignedUploader_lib.png",
@@ -75,7 +79,6 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Content-Type to enforce on PUT (must match the presign)")] string contentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
 
-    // NEW: S3 -> ODC (download from S3 via presigned GET into an ODC REST Target)
     [OSAction(Description = "Download from S3 (pre-signed GET) and POST the stream into an ODC REST target (with ?Key=...)")]
     DownloadToRestResult DownloadFromPresignedUrlToRest(
       [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
@@ -86,16 +89,16 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Content-Type to send to target (optional; if empty, propagate S3's)")] string targetContentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
 
-     [OSAction(Description = "Chunked: download from S3 (pre-signed GET) and POST in parts to an ODC REST target (?Key=...) to bypass 30MB limit")]
+    [OSAction(Description = "Chunked: download from S3 (pre-signed GET) and POST in parts to an ODC REST target (?Key=...) to bypass 30MB limit")]
     DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
       [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
       [OSParameter(Description = "Target ODC REST base URL (receives binary via POST)")] string targetUrl,
       [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
       [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
       [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
-      [OSParameter(Description = "Content-Type to send (optional; if empty, propagate S3's)")] string targetContentType,
+      [OSParameter(Description = "Content-Type to send (fixed for all chunks; default application/octet-stream)")] string targetContentType,
       [OSParameter(Description = "Chunk size in bytes (default 25,000,000 ≈ 25 MB)")] int chunkSizeBytes,
-      [OSParameter(Description = "Timeout per chunk request in seconds (default 120)")] int timeoutSeconds); 
+      [OSParameter(Description = "Timeout per chunk request in seconds (default 120)")] int timeoutSeconds);
   }
 
   // -------- Implementation --------
@@ -129,7 +132,8 @@ namespace AWSS3PreSignedUploader
       };
       return s3.GetPreSignedURL(req);
     }
-    // NEW: Direct stream uploader to S3 from ODC REST endpoint     
+
+    // --- Upload ODC REST -> S3 (single PUT) ---
     public string UploadFromRestToPresignedUrl(
       string sourceUrl,
       string binGuid,
@@ -147,7 +151,6 @@ namespace AWSS3PreSignedUploader
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
       { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
-      // 1) Open a streaming GET to the source ODC REST endpoint
       var resolvedSourceUrl = AppendQueryParameter(sourceUrl, "binGuid", binGuid);
       using var getReq = new HttpRequestMessage(HttpMethod.Get, resolvedSourceUrl);
       if (!string.IsNullOrWhiteSpace(authHeaderName) && !string.IsNullOrWhiteSpace(authHeaderValue))
@@ -171,32 +174,23 @@ namespace AWSS3PreSignedUploader
         srcStream.CopyTo(buffered);
         buffered.Position = 0;
         srcStream.Dispose();
-
         putContent = new StreamContent(buffered);
         putContent.Headers.ContentLength = buffered.Length;
       }
 
-      // 2) Stream directly into S3 PUT using the pre-signed URL(pre-signed single-part)
-      using var putReq = new HttpRequestMessage(HttpMethod.Put, presignedPutUrl)
-      { 
-        Content = putContent 
-      };
+      using var putReq = new HttpRequestMessage(HttpMethod.Put, presignedPutUrl) { Content = putContent };
       if (!string.IsNullOrWhiteSpace(contentType))
         putReq.Content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
-
-      // Avoid the 100-continue round trip; keep headers small, 
-      // saves a round trip, which matters when you already know the upload will be accepted
       putReq.Headers.ExpectContinue = false;
 
       using var putResp = http.Send(putReq, HttpCompletionOption.ResponseHeadersRead);
       putResp.EnsureSuccessStatusCode();
 
-      // S3 returns ETag header for a successful single-part PUT
       var etag = putResp.Headers.ETag?.Tag?.Trim('"') ?? string.Empty;
       return etag;
     }
 
-    // NEW: pre-signed GET (S3) -> POST binary to ODC REST target
+    // --- S3 -> ODC REST (single POST; small files) ---
     public DownloadToRestResult DownloadFromPresignedUrlToRest(
       string presignedGetUrl,
       string targetUrl,
@@ -214,7 +208,6 @@ namespace AWSS3PreSignedUploader
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
       { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
-      // 1) GET from S3 (streaming)
       using var getReq = new HttpRequestMessage(HttpMethod.Get, presignedGetUrl);
       using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
       getResp.EnsureSuccessStatusCode();
@@ -223,10 +216,8 @@ namespace AWSS3PreSignedUploader
       var sourceContentType = getResp.Content.Headers.ContentType?.MediaType;
       var sourceLength      = getResp.Content.Headers.ContentLength;
 
-      // 2) Build target URL with ?Key=<s3ObjectKey>
       var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
 
-      // 3) POST to ODC target (streaming)
       using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) {
         Content = new StreamContent(srcStream)
       };
@@ -244,33 +235,24 @@ namespace AWSS3PreSignedUploader
       postReq.Headers.ExpectContinue = false;
 
       using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
-      // We read headers/body regardless of status to surface errors cleanly
+
       var successHeader = GetHeaderValue(postResp, "success");
       var errorHeader   = GetHeaderValue(postResp, "errorMessage");
+      string body       = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
 
-      string body = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
-
-      // Try to parse binGUID from body (accept plain text or {"binGUID":"..."} JSON)
       var binGuid = ExtractBinGuidFromBody(body);
+      var httpOk  = postResp.IsSuccessStatusCode;
 
-      // If HTTP not successful, ensure Success=false and preserve error message
-      var httpOk = postResp.IsSuccessStatusCode;
+      bool success       = ParseBool(successHeader ?? string.Empty) && httpOk;
+      string errorMessage= errorHeader ?? (httpOk ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
 
-      bool success = ParseBool(successHeader ?? string.Empty) && httpOk;
-      string errorMessage = errorHeader ?? string.Empty;
-      if (!httpOk && string.IsNullOrWhiteSpace(errorMessage))
-        errorMessage = $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
-
-      return new DownloadToRestResult {
-        BinGuid = binGuid,
-        Success = success,
-        ErrorMessage = errorMessage ?? string.Empty
-      };
+      return new DownloadToRestResult { BinGuid = binGuid, Success = success, ErrorMessage = errorMessage };
     }
 
     private static readonly HttpStatusCode[] TransientStatus =
       { HttpStatusCode.Forbidden, HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout };
 
+    // --- S3 -> ODC REST (chunked; large files) ---
     public DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
       string presignedGetUrl,
       string targetUrl,
@@ -285,7 +267,7 @@ namespace AWSS3PreSignedUploader
       if (string.IsNullOrWhiteSpace(targetUrl))       throw new ArgumentException("targetUrl is required.");
       if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
 
-      // Keep headroom under the 30MB gateway limit
+      // Keep headroom under the ~30MB gateway limit
       const int maxChunkSize = 25_000_000;
       if (chunkSizeBytes <= 0 || chunkSizeBytes > maxChunkSize) chunkSizeBytes = maxChunkSize; // default to 25 MB
       if (timeoutSeconds <= 0) timeoutSeconds = 120;
@@ -293,33 +275,33 @@ namespace AWSS3PreSignedUploader
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
       { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
-      // 1) Open streaming GET from S3
+      // A) Determine total length up-front so we ALWAYS send X-Chunk-Total
+      var contentLength = TryGetContentLength(http, presignedGetUrl);
+      if (!contentLength.HasValue)
+        throw new InvalidOperationException("Cannot determine source length (HEAD and ranged GET both failed).");
+
+      int totalChunks = (int)((contentLength.Value + (chunkSizeBytes - 1)) / chunkSizeBytes);
+
+      // Open streaming GET from S3
       using var getReq = new HttpRequestMessage(HttpMethod.Get, presignedGetUrl);
       using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
       getResp.EnsureSuccessStatusCode();
 
-      var srcStream         = getResp.Content.ReadAsStream();
-      var sourceContentType = getResp.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
-      var sourceLength      = getResp.Content.Headers.ContentLength;
+      var srcStream = getResp.Content.ReadAsStream();
 
-      // 2) Build target URL with ?Key=<s3ObjectKey>
+      // B) Force a single content-type for all chunks
+      var forcedContentType = string.IsNullOrWhiteSpace(targetContentType)
+        ? "application/octet-stream"
+        : targetContentType;
+
       var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
 
-      // 3) Prepare chunk loop
-      var uploadId     = Guid.NewGuid().ToString("N");
-      var buffer       = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
+      var uploadId = Guid.NewGuid().ToString("N");
+      var buffer   = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
       try
       {
-        long totalRead   = 0;
-        int  index       = 0;
-        int? totalChunks = null;
-
-        if (sourceLength.HasValue)
-        {
-          var chunks = (int)(sourceLength.Value / chunkSizeBytes);
-          if (sourceLength.Value % chunkSizeBytes != 0) chunks++;
-          totalChunks = Math.Max(chunks, 1);
-        }
+        long totalRead = 0;
+        int  index     = 0;
 
         DownloadToRestResult finalResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "" };
 
@@ -328,40 +310,32 @@ namespace AWSS3PreSignedUploader
           int read = ReadFull(srcStream, buffer, 0, chunkSizeBytes);
           if (read <= 0)
           {
-            // EOF reached with no bytes on this iteration. If this is the first iteration, no data at all.
             if (index == 0)
               return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Source stream is empty." };
             break;
           }
 
           totalRead += read;
-          bool isLast = sourceLength.HasValue
-            ? (totalRead >= sourceLength.Value)               // exact when length known
-            : (read < chunkSizeBytes);                         // heuristic when unknown length
-
-          // Construct request for this chunk
-          var contentType = string.IsNullOrWhiteSpace(targetContentType) ? sourceContentType : targetContentType;
+          bool isLast = (index == totalChunks - 1) || (totalRead >= contentLength.Value);
 
           DownloadToRestResult? attemptResult = null;
 
-          // Up to 3 attempts per chunk (helps on transient 403/50x)
           const int maxAttempts = 3;
           for (int attempt = 1; attempt <= maxAttempts; attempt++)
           {
             using var content = new ByteArrayContent(buffer, 0, read);
-            content.Headers.ContentType   = new MediaTypeHeaderValue(contentType);
+            content.Headers.ContentType   = new MediaTypeHeaderValue(forcedContentType);
             content.Headers.ContentLength = read;
 
             using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) { Content = content };
 
-            // Chunk headers for assembly
+            // Chunk headers for assembly (server is 0-based)
             postReq.Headers.TryAddWithoutValidation("X-Upload-Id",       uploadId);
-            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index",     index.ToString());         // 0-based
-            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index-Base","0");                      // tell server the base
-            if (totalChunks.HasValue) postReq.Headers.TryAddWithoutValidation("X-Chunk-Total", totalChunks.Value.ToString());
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index",     index.ToString());
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index-Base","0");
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Total",     totalChunks.ToString());
             postReq.Headers.TryAddWithoutValidation("X-Last-Chunk",      isLast ? "true" : "false");
 
-            // Auth header (every chunk)
             if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
               postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
 
@@ -369,14 +343,12 @@ namespace AWSS3PreSignedUploader
 
             using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
 
-            // transient error? retry with small backoff
             if (!postResp.IsSuccessStatusCode && TransientStatus.Contains(postResp.StatusCode) && attempt < maxAttempts)
             {
-              System.Threading.Thread.Sleep(200 * attempt); // simple linear backoff
+              System.Threading.Thread.Sleep(200 * attempt);
               continue;
             }
 
-            // On last chunk, read the finalization payload/headers
             if (isLast)
             {
               var successHeader = GetHeaderValue(postResp, "success");
@@ -391,7 +363,6 @@ namespace AWSS3PreSignedUploader
             }
             else
             {
-              // Non-final chunks just need 2xx
               if (!postResp.IsSuccessStatusCode)
               {
                 var msg = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
@@ -403,25 +374,22 @@ namespace AWSS3PreSignedUploader
               }
             }
 
-            break; // break attempts loop
+            break;
           }
 
-          if (attemptResult == null) // defensive
+          if (attemptResult == null)
             return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Unknown error sending chunk." };
 
           if (!attemptResult.Value.Success)
-            return attemptResult.Value; // fail fast on broken chunk
+            return attemptResult.Value;
 
           if (isLast)
           {
             finalResult = attemptResult.Value;
-            return finalResult; // successful finalization
+            return finalResult;
           }
-
-          // continue loop for next chunk
         }
 
-        // Should not reach here for a normal file
         return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Unexpected end of stream without final chunk." };
       }
       finally
@@ -430,8 +398,54 @@ namespace AWSS3PreSignedUploader
       }
     }
 
-    // Read up to count bytes, return actual read (0 means EOF)
-    // Fills the buffer as much as possible but does not block for a full chunk if stream ends earlier.
+    // ===== Helpers =====
+
+    // Try to obtain Content-Length via HEAD; if missing, use 1-byte ranged GET and parse Content-Range.
+    private static long? TryGetContentLength(HttpClient http, string url)
+    {
+      // Attempt HEAD
+      try
+      {
+        using var head = new HttpRequestMessage(HttpMethod.Head, url);
+        using var resp = http.Send(head);
+        if (resp.IsSuccessStatusCode)
+        {
+          var len = resp.Content.Headers.ContentLength;
+          if (len.HasValue) return len.Value;
+        }
+      }
+      catch { /* ignore and fall back */ }
+
+      // Fallback: GET with Range: bytes=0-0 to get Content-Range: bytes 0-0/12345
+      try
+      {
+        using var ranged = new HttpRequestMessage(HttpMethod.Get, url);
+        ranged.Headers.Range = new RangeHeaderValue(0, 0);
+        using var resp = http.Send(ranged, HttpCompletionOption.ResponseHeadersRead);
+        if ((int)resp.StatusCode == 206) // Partial Content
+        {
+          var cr = resp.Content.Headers.ContentRange; // may be null depending on handler; handle manually if needed
+          if (cr != null && cr.Length.HasValue) return cr.Length.Value;
+
+          // Manual parse as a fallback
+          if (resp.Content.Headers.TryGetValues("Content-Range", out var values))
+          {
+            var val = values.FirstOrDefault(); // e.g., "bytes 0-0/12345"
+            if (!string.IsNullOrEmpty(val))
+            {
+              var slash = val.LastIndexOf('/');
+              if (slash > 0 && long.TryParse(val.Substring(slash + 1), out var total))
+                return total;
+            }
+          }
+        }
+      }
+      catch { /* ignore */ }
+
+      return null;
+    }
+
+    // Read up to count bytes; returns actual read (0 = EOF)
     private static int ReadFull(Stream s, byte[] buffer, int offset, int count)
     {
       int total = 0;
@@ -440,11 +454,10 @@ namespace AWSS3PreSignedUploader
         int n = s.Read(buffer, offset + total, count - total);
         if (n <= 0) break;
         total += n;
-        if (n == 0) break;
       }
       return total;
     }
-    // --- helpers ---
+
     private static string? GetHeaderValue(HttpResponseMessage resp, string headerName)
     {
       if (resp.Headers.TryGetValues(headerName, out var values))
@@ -457,8 +470,9 @@ namespace AWSS3PreSignedUploader
     private static bool ParseBool(string value)
     {
       if (string.IsNullOrWhiteSpace(value)) return false;
-      return value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-            value.Equals("1")    || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+      return value.Equals("true", StringComparison.OrdinalIgnoreCase)
+          || value.Equals("1")
+          || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ExtractBinGuidFromBody(string body)
@@ -466,7 +480,6 @@ namespace AWSS3PreSignedUploader
       if (string.IsNullOrWhiteSpace(body)) return string.Empty;
       var trimmed = body.Trim().Trim('"');
 
-      // Try JSON: {"binGUID":"..."} (case-insensitive)
       if (trimmed.StartsWith("{") && trimmed.EndsWith("}"))
       {
         try
@@ -478,10 +491,9 @@ namespace AWSS3PreSignedUploader
         }
         catch { /* fall back to plain text */ }
       }
-
-      // Assume plain text body contains the GUID
       return trimmed;
     }
+
     private static string AppendQueryParameter(string url, string name, string value)
     {
       if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("URL cannot be empty.", nameof(url));
