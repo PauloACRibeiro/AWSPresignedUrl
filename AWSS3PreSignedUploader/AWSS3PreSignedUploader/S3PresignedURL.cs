@@ -14,7 +14,7 @@ using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
 
-// -------- Version 1.2.1 of the Library --------
+// -------- Version 1.2.4 of the Library --------
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
@@ -94,7 +94,7 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
       [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
       [OSParameter(Description = "Content-Type to send (optional; if empty, propagate S3's)")] string targetContentType,
-      [OSParameter(Description = "Chunk size in bytes (default 8,388,608 = 8MB)")] int chunkSizeBytes,
+      [OSParameter(Description = "Chunk size in bytes (default 25,000,000 ≈ 25 MB)")] int chunkSizeBytes,
       [OSParameter(Description = "Timeout per chunk request in seconds (default 120)")] int timeoutSeconds); 
   }
 
@@ -286,7 +286,8 @@ namespace AWSS3PreSignedUploader
       if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
 
       // Keep headroom under the 30MB gateway limit
-      if (chunkSizeBytes <= 0 || chunkSizeBytes > 25_000_000) chunkSizeBytes = 8 * 1024 * 1024; // 8 MB default
+      const int maxChunkSize = 25_000_000;
+      if (chunkSizeBytes <= 0 || chunkSizeBytes > maxChunkSize) chunkSizeBytes = maxChunkSize; // default to 25 MB
       if (timeoutSeconds <= 0) timeoutSeconds = 120;
 
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
@@ -341,15 +342,13 @@ namespace AWSS3PreSignedUploader
           // Construct request for this chunk
           var contentType = string.IsNullOrWhiteSpace(targetContentType) ? sourceContentType : targetContentType;
 
-          // Copy the chunk into an exact-sized array content
-          var chunkBytes = buffer.AsSpan(0, read).ToArray();
           DownloadToRestResult? attemptResult = null;
 
           // Up to 3 attempts per chunk (helps on transient 403/50x)
           const int maxAttempts = 3;
           for (int attempt = 1; attempt <= maxAttempts; attempt++)
           {
-            using var content = new ByteArrayContent(chunkBytes);
+            using var content = new ByteArrayContent(buffer, 0, read);
             content.Headers.ContentType   = new MediaTypeHeaderValue(contentType);
             content.Headers.ContentLength = read;
 
