@@ -2,9 +2,12 @@
 using System.IO;
 using System.Net.Http;
 using System.Linq;
-using System.Text.Json;
-using System.Net.Http.Headers;
 using System.Buffers;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.Json;
 using System.Security.Cryptography;
 using OutSystems.ExternalLibraries.SDK;
 using Amazon;
@@ -265,6 +268,9 @@ namespace AWSS3PreSignedUploader
       };
     }
 
+    private static readonly HttpStatusCode[] TransientStatus =
+      { HttpStatusCode.Forbidden, HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout };
+
     public DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
       string presignedGetUrl,
       string targetUrl,
@@ -279,8 +285,8 @@ namespace AWSS3PreSignedUploader
       if (string.IsNullOrWhiteSpace(targetUrl))       throw new ArgumentException("targetUrl is required.");
       if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
 
-      if (chunkSizeBytes <= 0 || chunkSizeBytes > 25_000_000) // keep headroom under 30MB
-        chunkSizeBytes = 8 * 1024 * 1024; // 8MB
+      // Keep headroom under the 30MB gateway limit
+      if (chunkSizeBytes <= 0 || chunkSizeBytes > 25_000_000) chunkSizeBytes = 8 * 1024 * 1024; // 8 MB default
       if (timeoutSeconds <= 0) timeoutSeconds = 120;
 
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
@@ -295,16 +301,16 @@ namespace AWSS3PreSignedUploader
       var sourceContentType = getResp.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
       var sourceLength      = getResp.Content.Headers.ContentLength;
 
-      // 2) Build target URL with ?Key=
+      // 2) Build target URL with ?Key=<s3ObjectKey>
       var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
 
       // 3) Prepare chunk loop
-      var uploadId = Guid.NewGuid().ToString("N");
-      var buffer   = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
+      var uploadId     = Guid.NewGuid().ToString("N");
+      var buffer       = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
       try
       {
-        long totalRead = 0;
-        int  index     = 0;
+        long totalRead   = 0;
+        int  index       = 0;
         int? totalChunks = null;
 
         if (sourceLength.HasValue)
@@ -319,76 +325,105 @@ namespace AWSS3PreSignedUploader
         for (;; index++)
         {
           int read = ReadFull(srcStream, buffer, 0, chunkSizeBytes);
-          if (read <= 0) break; // EOF
+          if (read <= 0)
+          {
+            // EOF reached with no bytes on this iteration. If this is the first iteration, no data at all.
+            if (index == 0)
+              return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Source stream is empty." };
+            break;
+          }
 
-          bool isLast = false;
           totalRead += read;
-          if (!sourceLength.HasValue)
+          bool isLast = sourceLength.HasValue
+            ? (totalRead >= sourceLength.Value)               // exact when length known
+            : (read < chunkSizeBytes);                         // heuristic when unknown length
+
+          // Construct request for this chunk
+          var contentType = string.IsNullOrWhiteSpace(targetContentType) ? sourceContentType : targetContentType;
+
+          // Copy the chunk into an exact-sized array content
+          var chunkBytes = buffer.AsSpan(0, read).ToArray();
+          DownloadToRestResult? attemptResult = null;
+
+          // Up to 3 attempts per chunk (helps on transient 403/50x)
+          const int maxAttempts = 3;
+          for (int attempt = 1; attempt <= maxAttempts; attempt++)
           {
-            // for unknown length, we only know last when we hit EOF on next read
-            // but since we can't preread without buffering, we set last when next read == 0
-            // solution: peek 1 byte with Positionable streams; here we will assume last when read < chunkSize
-            isLast = read < chunkSizeBytes;
+            using var content = new ByteArrayContent(chunkBytes);
+            content.Headers.ContentType   = new MediaTypeHeaderValue(contentType);
+            content.Headers.ContentLength = read;
+
+            using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) { Content = content };
+
+            // Chunk headers for assembly
+            postReq.Headers.TryAddWithoutValidation("X-Upload-Id",       uploadId);
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index",     index.ToString());         // 0-based
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index-Base","0");                      // tell server the base
+            if (totalChunks.HasValue) postReq.Headers.TryAddWithoutValidation("X-Chunk-Total", totalChunks.Value.ToString());
+            postReq.Headers.TryAddWithoutValidation("X-Last-Chunk",      isLast ? "true" : "false");
+
+            // Auth header (every chunk)
+            if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
+              postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
+
+            postReq.Headers.ExpectContinue = false;
+
+            using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
+
+            // transient error? retry with small backoff
+            if (!postResp.IsSuccessStatusCode && TransientStatus.Contains(postResp.StatusCode) && attempt < maxAttempts)
+            {
+              System.Threading.Thread.Sleep(200 * attempt); // simple linear backoff
+              continue;
+            }
+
+            // On last chunk, read the finalization payload/headers
+            if (isLast)
+            {
+              var successHeader = GetHeaderValue(postResp, "success");
+              var errorHeader   = GetHeaderValue(postResp, "errorMessage");
+              var body          = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
+              var binGuid       = ExtractBinGuidFromBody(body);
+
+              bool success      = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
+              string errorMsg   = errorHeader ?? (success ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
+
+              attemptResult = new DownloadToRestResult { BinGuid = binGuid, Success = success, ErrorMessage = errorMsg };
+            }
+            else
+            {
+              // Non-final chunks just need 2xx
+              if (!postResp.IsSuccessStatusCode)
+              {
+                var msg = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
+                attemptResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = msg };
+              }
+              else
+              {
+                attemptResult = new DownloadToRestResult { BinGuid = "", Success = true, ErrorMessage = "" };
+              }
+            }
+
+            break; // break attempts loop
           }
-          else
-          {
-            isLast = (totalRead >= sourceLength.Value);
-          }
 
-          using var content = new ByteArrayContent(buffer.AsSpan(0, read).ToArray());
-          content.Headers.ContentType = new MediaTypeHeaderValue(
-            string.IsNullOrWhiteSpace(targetContentType) ? sourceContentType : targetContentType
-          );
-          content.Headers.ContentLength = read;
+          if (attemptResult == null) // defensive
+            return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Unknown error sending chunk." };
 
-          using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) { Content = content };
-
-          // Chunk headers for the target to assemble
-          postReq.Headers.TryAddWithoutValidation("X-Upload-Id",  uploadId);
-          postReq.Headers.TryAddWithoutValidation("X-Chunk-Index", index.ToString());
-          if (totalChunks.HasValue) postReq.Headers.TryAddWithoutValidation("X-Chunk-Total", totalChunks.Value.ToString());
-          if (isLast)               postReq.Headers.TryAddWithoutValidation("X-Last-Chunk", "true");
-
-          // Auth header
-          if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
-            postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
-
-          postReq.Headers.ExpectContinue = false;
-
-          using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
-          // For intermediate chunks we accept 2xx without reading/returning anything special
-          var ok = postResp.IsSuccessStatusCode;
-          if (!ok)
-          {
-            var error = GetHeaderValue(postResp, "errorMessage")
-                        ?? $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}";
-            return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = error };
-          }
+          if (!attemptResult.Value.Success)
+            return attemptResult.Value; // fail fast on broken chunk
 
           if (isLast)
           {
-            // Final chunk expected to return headers + body we defined
-            var successHeader = GetHeaderValue(postResp, "success");
-            var errorHeader   = GetHeaderValue(postResp, "errorMessage");
-            var body          = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
-            var binGuid       = ExtractBinGuidFromBody(body);
-
-            bool success = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
-            string errorMessage = errorHeader ?? (success ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
-
-            finalResult = new DownloadToRestResult {
-              BinGuid = binGuid,
-              Success = success,
-              ErrorMessage = errorMessage
-            };
-            return finalResult;
+            finalResult = attemptResult.Value;
+            return finalResult; // successful finalization
           }
 
           // continue loop for next chunk
         }
 
-        // If we reached here without last chunk being sent (e.g., zero-length)
-        return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "No data read from source." };
+        // Should not reach here for a normal file
+        return new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "Unexpected end of stream without final chunk." };
       }
       finally
       {
