@@ -12,10 +12,9 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.2.5 of the Library --------
-// - A) Pre-fetch total content length via HEAD (fallback 1-byte Range GET) and ALWAYS send X-Chunk-Total
-// - B) Force a single Content-Type for every chunk (either provided or application/octet-stream)
-//
+// -------- Version 1.2.6 of the Library --------
+// Remove "DownloadFromPresignedUrlToRest" as its functionality is more limited than "DownloadFromPresignedUrlToRestChunked"
+// Rename "DownloadFromPresignedUrlToRestChunked" to "DownloadFromPresignedUrlToRest"
 
 namespace AWSS3PreSignedUploader
 {
@@ -79,18 +78,8 @@ namespace AWSS3PreSignedUploader
       [OSParameter(Description = "Content-Type to enforce on PUT (must match the presign)")] string contentType,
       [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
 
-    [OSAction(Description = "Download from S3 (pre-signed GET) and POST the stream into an ODC REST target (with ?Key=...)")]
+    [OSAction(Description = "Download from S3 (pre-signed GET) and POST in parts (chunks) to an ODC REST target to bypass 30MB limit")]
     DownloadToRestResult DownloadFromPresignedUrlToRest(
-      [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
-      [OSParameter(Description = "Target ODC REST base URL (receives the binary via POST)")] string targetUrl,
-      [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
-      [OSParameter(Description = "Auth header name for the target (e.g., Authorization)")] string targetAuthHeaderName,
-      [OSParameter(Description = "Auth header value for the target")] string targetAuthHeaderValue,
-      [OSParameter(Description = "Content-Type to send to target (optional; if empty, propagate S3's)")] string targetContentType,
-      [OSParameter(Description = "Timeout in seconds (default 300)")] int timeoutSeconds);
-
-    [OSAction(Description = "Chunked: download from S3 (pre-signed GET) and POST in parts to an ODC REST target (?Key=...) to bypass 30MB limit")]
-    DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
       [OSParameter(Description = "Pre-signed S3 GET URL")] string presignedGetUrl,
       [OSParameter(Description = "Target ODC REST base URL (receives binary via POST)")] string targetUrl,
       [OSParameter(Description = "S3 object Key to append as URL parameter ?Key=<key>")] string s3ObjectKey,
@@ -189,71 +178,11 @@ namespace AWSS3PreSignedUploader
       var etag = putResp.Headers.ETag?.Tag?.Trim('"') ?? string.Empty;
       return etag;
     }
-
-    // --- S3 -> ODC REST (single POST; small files) ---
-    public DownloadToRestResult DownloadFromPresignedUrlToRest(
-      string presignedGetUrl,
-      string targetUrl,
-      string s3ObjectKey,
-      string targetAuthHeaderName,
-      string targetAuthHeaderValue,
-      string targetContentType,
-      int timeoutSeconds)
-    {
-      if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
-      if (string.IsNullOrWhiteSpace(targetUrl))       throw new ArgumentException("targetUrl is required.");
-      if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
-      if (timeoutSeconds <= 0) timeoutSeconds = 300;
-
-      using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
-      { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
-
-      using var getReq = new HttpRequestMessage(HttpMethod.Get, presignedGetUrl);
-      using var getResp = http.Send(getReq, HttpCompletionOption.ResponseHeadersRead);
-      getResp.EnsureSuccessStatusCode();
-
-      var srcStream         = getResp.Content.ReadAsStream();
-      var sourceContentType = getResp.Content.Headers.ContentType?.MediaType;
-      var sourceLength      = getResp.Content.Headers.ContentLength;
-
-      var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
-
-      using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) {
-        Content = new StreamContent(srcStream)
-      };
-
-      var effectiveContentType = !string.IsNullOrWhiteSpace(targetContentType)
-          ? targetContentType
-          : (sourceContentType ?? "application/octet-stream");
-
-      postReq.Content.Headers.ContentType = new MediaTypeHeaderValue(effectiveContentType);
-      if (sourceLength.HasValue) postReq.Content.Headers.ContentLength = sourceLength.Value;
-
-      if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
-        postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
-
-      postReq.Headers.ExpectContinue = false;
-
-      using var postResp = http.Send(postReq, HttpCompletionOption.ResponseHeadersRead);
-
-      var successHeader = GetHeaderValue(postResp, "success");
-      var errorHeader   = GetHeaderValue(postResp, "errorMessage");
-      string body       = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
-
-      var binGuid = ExtractBinGuidFromBody(body);
-      var httpOk  = postResp.IsSuccessStatusCode;
-
-      bool success       = ParseBool(successHeader ?? string.Empty) && httpOk;
-      string errorMessage= errorHeader ?? (httpOk ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
-
-      return new DownloadToRestResult { BinGuid = binGuid, Success = success, ErrorMessage = errorMessage };
-    }
-
     private static readonly HttpStatusCode[] TransientStatus =
       { HttpStatusCode.Forbidden, HttpStatusCode.BadGateway, HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout };
 
     // --- S3 -> ODC REST (chunked; large files) ---
-    public DownloadToRestResult DownloadFromPresignedUrlToRestChunked(
+    public DownloadToRestResult DownloadFromPresignedUrlToRest(
       string presignedGetUrl,
       string targetUrl,
       string s3ObjectKey,
