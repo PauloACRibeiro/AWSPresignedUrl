@@ -13,12 +13,12 @@ using Amazon.S3.Model;
 
 //
 // -------- Version 1.3.1 --------
-// - Keeps UploadFromRestToPresignedUrl (single-part PUT) for small/medium files
+// Improves Output for UploadFromRestToS3Multipart and errorhandling when TotalLenght of content is not returned
+// Keeps UploadFromRestToPresignedUrl (single-part PUT) for small/medium files
 // - Adds UploadFromRestToS3Multipart (ODC REST -> S3 multipart) for large files
 // - Restores DownloadFromPresignedUrlToRest (S3 -> ODC REST, chunked) with:
 //     A) Always send X-Chunk-Total (length discovered via HEAD or 1-byte ranged GET)
 //     B) Force a single Content-Type for all chunks
-//
 
 namespace AWSS3PreSignedUploader
 {
