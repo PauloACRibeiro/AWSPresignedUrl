@@ -12,7 +12,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.3.0 --------
+// -------- Version 1.3.1 --------
 // - Keeps UploadFromRestToPresignedUrl (single-part PUT) for small/medium files
 // - Adds UploadFromRestToS3Multipart (ODC REST -> S3 multipart) for large files
 // - Restores DownloadFromPresignedUrlToRest (S3 -> ODC REST, chunked) with:
@@ -46,6 +46,19 @@ namespace AWSS3PreSignedUploader
     public bool Success { get; set; }
 
     [OSStructureField(Description = "Error message from the ODC REST (if any)")]
+    public string ErrorMessage { get; set; }
+  }
+
+  [OSStructure(Description = "Result of uploading from an ODC REST source into S3")]
+  public struct UploadToS3Result
+  {
+    [OSStructureField(Description = "GUID identifying the binary used as the source in the upload")]
+    public string BinGuid { get; set; }
+
+    [OSStructureField(Description = "True if the multipart upload completed successfully")]
+    public bool Success { get; set; }
+
+    [OSStructureField(Description = "Error message if the upload failed")]
     public string ErrorMessage { get; set; }
   }
 
@@ -97,7 +110,7 @@ namespace AWSS3PreSignedUploader
 
     // NEW: Large files – source is fetched in many small responses; target uses S3 Multipart Upload (no presigned URL).
     [OSAction(Description = "Upload a large binary from ODC REST to S3 using MULTIPART (pull source in chunks)")]
-    string UploadFromRestToS3Multipart(
+    UploadToS3Result UploadFromRestToS3Multipart(
       [OSParameter(Description = "Auth info for S3 (AccessKey/Secret/Region)")] S3AuthInfo authInfo,
       [OSParameter(Description = "S3 bucket name")] string bucketName,
       [OSParameter(Description = "S3 object key to create")] string key,
@@ -349,7 +362,7 @@ namespace AWSS3PreSignedUploader
     }
 
     // ---------- NEW: ODC REST (chunked GETs) -> S3 MULTIPART ----------
-    public string UploadFromRestToS3Multipart(
+    public UploadToS3Result UploadFromRestToS3Multipart(
       S3AuthInfo authInfo,
       string bucketName,
       string key,
@@ -375,25 +388,30 @@ namespace AWSS3PreSignedUploader
       // Discover total size (so we know how many parts)
       var length = TryProbeLength(http, sourceUrl, binGuid, authHeaderName, authHeaderValue);
       if (!length.HasValue)
-        throw new InvalidOperationException("Source endpoint must provide total length (HEAD or 1-byte probe failed).");
+        return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = "Source endpoint must provide total length (HEAD or 1-byte probe failed)." };
 
       long totalLength = length.Value;
-      int  totalParts  = (int)((totalLength + (long)chunkSizeBytes - 1) / chunkSizeBytes);
+      if (totalLength <= 0)
+        return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = "Source stream is empty." };
 
-      // Initiate multipart
-      var initiate = s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest {
-        BucketName  = bucketName,
-        Key         = key,
-        ContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType
-      }).GetAwaiter().GetResult();
+      int totalParts = (int)((totalLength + (long)chunkSizeBytes - 1) / chunkSizeBytes);
+      if (totalParts > 10_000)
+        return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = "Computed part count exceeds S3 multipart limit (10,000). Increase chunk size." };
 
-      string uploadId = initiate.UploadId;
-      var partETags   = new System.Collections.Generic.List<PartETag>(capacity: totalParts);
-
-      // Loop parts
       var buffer = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
+      string uploadId = string.Empty;
+      var partETags = new System.Collections.Generic.List<PartETag>(capacity: totalParts);
       try
       {
+        // Initiate multipart
+        var initiate = s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest {
+          BucketName  = bucketName,
+          Key         = key,
+          ContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType
+        }).GetAwaiter().GetResult();
+
+        uploadId = initiate.UploadId;
+
         long offset = 0;
         for (int partNumber = 1; partNumber <= totalParts; partNumber++)
         {
@@ -445,15 +463,18 @@ namespace AWSS3PreSignedUploader
           UploadId   = uploadId
         };
         complete.AddPartETags(partETags);
-        var completed = s3.CompleteMultipartUploadAsync(complete).GetAwaiter().GetResult();
-
-        return completed.ETag?.Trim('\"') ?? string.Empty;
+        s3.CompleteMultipartUploadAsync(complete).GetAwaiter().GetResult();
+        // Successful completion means the object is committed in S3; we return a success status with the original binGuid reference.
+        return new UploadToS3Result { BinGuid = binGuid, Success = true, ErrorMessage = string.Empty };
       }
-      catch
+      catch (Exception ex)
       {
-        try { s3.AbortMultipartUploadAsync(new AbortMultipartUploadRequest { BucketName = bucketName, Key = key, UploadId = uploadId }).GetAwaiter().GetResult(); }
-        catch { /* best effort */ }
-        throw;
+        if (!string.IsNullOrEmpty(uploadId))
+        {
+          try { s3.AbortMultipartUploadAsync(new AbortMultipartUploadRequest { BucketName = bucketName, Key = key, UploadId = uploadId }).GetAwaiter().GetResult(); }
+          catch { /* best effort */ }
+        }
+        return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = ex.Message };
       }
       finally
       {
@@ -527,7 +548,7 @@ namespace AWSS3PreSignedUploader
       }
       catch { }
 
-      // Fallback 1-byte probe (?offset=0&length=1) with optional X-Total-Length in response headers
+      // Fallback 1-byte probe (?offset=0&length=1) expecting either X-Total-Length or Content-Range headers
       try
       {
         var probeUrl = AppendQueryParameter(
@@ -546,6 +567,33 @@ namespace AWSS3PreSignedUploader
           if (resp.Headers.TryGetValues("X-Total-Length", out var vals))
             if (long.TryParse(vals.FirstOrDefault(), out var total))
               return total;
+
+          var cr = resp.Content?.Headers?.ContentRange;
+          if (cr != null)
+          {
+            if (cr.Length.HasValue) return cr.Length.Value;
+            // ContentRangeHeaderValue.ToString() follows "bytes start-end/total"
+            var crText = cr.ToString();
+            if (!string.IsNullOrEmpty(crText))
+            {
+              var slash = crText.LastIndexOf('/');
+              if (slash > 0 && long.TryParse(crText.Substring(slash + 1), out var totalFromText))
+                return totalFromText;
+            }
+          }
+
+          // Some handlers may expose Content-Range as a raw header
+          if (resp.Content?.Headers?.TryGetValues("Content-Range", out var rawRanges) == true ||
+              resp.Headers.TryGetValues("Content-Range", out rawRanges))
+          {
+            var raw = rawRanges.FirstOrDefault();
+            if (!string.IsNullOrEmpty(raw))
+            {
+              var slash = raw.LastIndexOf('/');
+              if (slash > 0 && long.TryParse(raw.Substring(slash + 1), out var totalFromRaw))
+                return totalFromRaw;
+            }
+          }
         }
       }
       catch { }
