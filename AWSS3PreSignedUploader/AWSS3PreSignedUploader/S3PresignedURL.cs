@@ -12,14 +12,10 @@ using Amazon.S3;
 using Amazon.S3.Model;
 
 //
-// -------- Version 1.3.1 --------
-// Improves Output for UploadFromRestToS3Multipart and errorhandling when TotalLenght of content is not returned
-// Keeps UploadFromRestToPresignedUrl (single-part PUT) for small/medium files
-// - Adds UploadFromRestToS3Multipart (ODC REST -> S3 multipart) for large files
-// - Restores DownloadFromPresignedUrlToRest (S3 -> ODC REST, chunked) with:
-//     A) Always send X-Chunk-Total (length discovered via HEAD or 1-byte ranged GET)
-//     B) Force a single Content-Type for all chunks
-
+// -------- Version 1.3.2 --------
+// UploadFromRestToS3Multipart:  improves errorhandling of Content-Length retrieval and error messages on chunked upload.
+// Still keeps UploadFromRestToPresignedUrl (single-part PUT) for small/medium files
+//
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
@@ -132,7 +128,8 @@ namespace AWSS3PreSignedUploader
     {
       Validate(authInfo, bucketName, key, durationInMinutes);
       using var s3 = CreateClient(authInfo);
-      var req = new GetPreSignedUrlRequest {
+      var req = new GetPreSignedUrlRequest
+      {
         BucketName = bucketName,
         Key = key,
         Verb = HttpVerb.GET,
@@ -145,7 +142,8 @@ namespace AWSS3PreSignedUploader
     {
       Validate(authInfo, bucketName, key, durationInMinutes);
       using var s3 = CreateClient(authInfo);
-      var req = new GetPreSignedUrlRequest {
+      var req = new GetPreSignedUrlRequest
+      {
         BucketName = bucketName,
         Key = key,
         Verb = HttpVerb.PUT,
@@ -165,9 +163,9 @@ namespace AWSS3PreSignedUploader
       string contentType,
       int timeoutSeconds)
     {
-      if (string.IsNullOrWhiteSpace(sourceUrl))        throw new ArgumentException("sourceUrl is required.");
-      if (string.IsNullOrWhiteSpace(binGuid))          throw new ArgumentException("binGuid is required.");
-      if (string.IsNullOrWhiteSpace(presignedPutUrl))  throw new ArgumentException("presignedPutUrl is required.");
+      if (string.IsNullOrWhiteSpace(sourceUrl)) throw new ArgumentException("sourceUrl is required.");
+      if (string.IsNullOrWhiteSpace(binGuid)) throw new ArgumentException("binGuid is required.");
+      if (string.IsNullOrWhiteSpace(presignedPutUrl)) throw new ArgumentException("presignedPutUrl is required.");
       if (timeoutSeconds <= 0) timeoutSeconds = 300;
 
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
@@ -227,8 +225,8 @@ namespace AWSS3PreSignedUploader
       int timeoutSeconds)
     {
       if (string.IsNullOrWhiteSpace(presignedGetUrl)) throw new ArgumentException("presignedGetUrl is required.");
-      if (string.IsNullOrWhiteSpace(targetUrl))       throw new ArgumentException("targetUrl is required.");
-      if (string.IsNullOrWhiteSpace(s3ObjectKey))     throw new ArgumentException("s3ObjectKey is required.");
+      if (string.IsNullOrWhiteSpace(targetUrl)) throw new ArgumentException("targetUrl is required.");
+      if (string.IsNullOrWhiteSpace(s3ObjectKey)) throw new ArgumentException("s3ObjectKey is required.");
 
       // Keep headroom under the ~30MB gateway limit
       const int maxChunkSize = 25_000_000;
@@ -260,15 +258,15 @@ namespace AWSS3PreSignedUploader
       var targetWithKey = AppendQueryParameter(targetUrl, "Key", s3ObjectKey);
 
       var uploadId = Guid.NewGuid().ToString("N");
-      var buffer   = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
+      var buffer = ArrayPool<byte>.Shared.Rent(chunkSizeBytes);
       try
       {
         long totalRead = 0;
-        int  index     = 0;
+        int index = 0;
 
         DownloadToRestResult finalResult = new DownloadToRestResult { BinGuid = "", Success = false, ErrorMessage = "" };
 
-        for (;; index++)
+        for (; ; index++)
         {
           int read = ReadFull(srcStream, buffer, 0, chunkSizeBytes);
           if (read <= 0)
@@ -287,17 +285,17 @@ namespace AWSS3PreSignedUploader
           for (int attempt = 1; attempt <= maxAttempts; attempt++)
           {
             using var content = new ByteArrayContent(buffer, 0, read);
-            content.Headers.ContentType   = new MediaTypeHeaderValue(forcedContentType);
+            content.Headers.ContentType = new MediaTypeHeaderValue(forcedContentType);
             content.Headers.ContentLength = read;
 
             using var postReq = new HttpRequestMessage(HttpMethod.Post, targetWithKey) { Content = content };
 
             // Chunk headers for assembly (server is 0-based)
-            postReq.Headers.TryAddWithoutValidation("X-Upload-Id",       uploadId);
-            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index",     index.ToString());
-            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index-Base","0");
-            postReq.Headers.TryAddWithoutValidation("X-Chunk-Total",     totalChunks.ToString());
-            postReq.Headers.TryAddWithoutValidation("X-Last-Chunk",      isLast ? "true" : "false");
+            postReq.Headers.TryAddWithoutValidation("X-Upload-Id", uploadId);
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index", index.ToString());
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Index-Base", "0");
+            postReq.Headers.TryAddWithoutValidation("X-Chunk-Total", totalChunks.ToString());
+            postReq.Headers.TryAddWithoutValidation("X-Last-Chunk", isLast ? "true" : "false");
 
             if (!string.IsNullOrWhiteSpace(targetAuthHeaderName) && !string.IsNullOrWhiteSpace(targetAuthHeaderValue))
               postReq.Headers.TryAddWithoutValidation(targetAuthHeaderName, targetAuthHeaderValue);
@@ -315,12 +313,12 @@ namespace AWSS3PreSignedUploader
             if (isLast)
             {
               var successHeader = GetHeaderValue(postResp, "success");
-              var errorHeader   = GetHeaderValue(postResp, "errorMessage");
-              var body          = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
-              var binGuid       = ExtractBinGuidFromBody(body);
+              var errorHeader = GetHeaderValue(postResp, "errorMessage");
+              var body = postResp.Content != null ? postResp.Content.ReadAsStringAsync().Result : string.Empty;
+              var binGuid = ExtractBinGuidFromBody(body);
 
-              bool success      = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
-              string errorMsg   = errorHeader ?? (success ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
+              bool success = ParseBool(successHeader ?? string.Empty) && postResp.IsSuccessStatusCode;
+              string errorMsg = errorHeader ?? (success ? "" : $"HTTP {(int)postResp.StatusCode} {postResp.ReasonPhrase}");
 
               attemptResult = new DownloadToRestResult { BinGuid = binGuid, Success = success, ErrorMessage = errorMsg };
             }
@@ -374,14 +372,14 @@ namespace AWSS3PreSignedUploader
       int chunkSizeBytes,
       int timeoutSeconds)
     {
-      if (string.IsNullOrWhiteSpace(bucketName))  throw new ArgumentException("bucketName is required.");
-      if (string.IsNullOrWhiteSpace(key))         throw new ArgumentException("key is required.");
-      if (string.IsNullOrWhiteSpace(sourceUrl))   throw new ArgumentException("sourceUrl is required.");
-      if (string.IsNullOrWhiteSpace(binGuid))     throw new ArgumentException("binGuid is required.");
-      if (chunkSizeBytes < 5 * 1024 * 1024)       chunkSizeBytes = 8 * 1024 * 1024; // S3 requires >= 5MB per part (except last)
-      if (timeoutSeconds <= 0)                    timeoutSeconds = 120;
+      if (string.IsNullOrWhiteSpace(bucketName)) throw new ArgumentException("bucketName is required.");
+      if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("key is required.");
+      if (string.IsNullOrWhiteSpace(sourceUrl)) throw new ArgumentException("sourceUrl is required.");
+      if (string.IsNullOrWhiteSpace(binGuid)) throw new ArgumentException("binGuid is required.");
+      if (chunkSizeBytes < 5 * 1024 * 1024) chunkSizeBytes = 8 * 1024 * 1024; // S3 requires >= 5MB per part (except last)
+      if (timeoutSeconds <= 0) timeoutSeconds = 120;
 
-      using var s3   = CreateClient(authInfo);
+      using var s3 = CreateClient(authInfo);
       using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
       { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
@@ -404,9 +402,10 @@ namespace AWSS3PreSignedUploader
       try
       {
         // Initiate multipart
-        var initiate = s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest {
-          BucketName  = bucketName,
-          Key         = key,
+        var initiate = s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest
+        {
+          BucketName = bucketName,
+          Key = key,
           ContentType = string.IsNullOrWhiteSpace(contentType) ? "application/octet-stream" : contentType
         }).GetAwaiter().GetResult();
 
@@ -443,13 +442,14 @@ namespace AWSS3PreSignedUploader
 
           // Upload part
           using var ms = new MemoryStream(buffer, 0, read, writable: false);
-          var uploadPartResponse = s3.UploadPartAsync(new UploadPartRequest {
-            BucketName   = bucketName,
-            Key          = key,
-            UploadId     = uploadId,
-            PartNumber   = partNumber,
-            PartSize     = read,
-            InputStream  = ms
+          var uploadPartResponse = s3.UploadPartAsync(new UploadPartRequest
+          {
+            BucketName = bucketName,
+            Key = key,
+            UploadId = uploadId,
+            PartNumber = partNumber,
+            PartSize = read,
+            InputStream = ms
           }).GetAwaiter().GetResult();
 
           partETags.Add(new PartETag(partNumber, uploadPartResponse.ETag));
@@ -457,12 +457,19 @@ namespace AWSS3PreSignedUploader
         }
 
         // Complete multipart
-        var complete = new CompleteMultipartUploadRequest {
+        var complete = new CompleteMultipartUploadRequest
+        {
           BucketName = bucketName,
-          Key        = key,
-          UploadId   = uploadId
+          Key = key,
+          UploadId = uploadId
         };
+        if (partETags.Count != totalParts)
+          return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = "Uploaded part count mismatch." };
+
+        if (partETags.Count == 0)
+          return new UploadToS3Result { BinGuid = binGuid, Success = false, ErrorMessage = "No parts uploaded." };
         complete.AddPartETags(partETags);
+
         s3.CompleteMultipartUploadAsync(complete).GetAwaiter().GetResult();
         // Successful completion means the object is committed in S3; we return a success status with the original binGuid reference.
         return new UploadToS3Result { BinGuid = binGuid, Success = true, ErrorMessage = string.Empty };
@@ -496,6 +503,11 @@ namespace AWSS3PreSignedUploader
         {
           var len = resp.Content.Headers.ContentLength;
           if (len.HasValue) return len.Value;
+
+          // Additional fallback: sometimes Content-Length is sent as a header, not in Content.Headers
+          if (resp.Headers.TryGetValues("Content-Length", out var hVals) &&
+              long.TryParse(hVals.FirstOrDefault(), out var headerLen))
+            return headerLen;
         }
       }
       catch { /* ignore and fall back */ }
@@ -662,12 +674,12 @@ namespace AWSS3PreSignedUploader
 
     private static void Validate(S3AuthInfo auth, string bucket, string key, int mins)
     {
-      if (string.IsNullOrWhiteSpace(auth.AccessKeyId))     throw new ArgumentException("AccessKeyId is required.");
+      if (string.IsNullOrWhiteSpace(auth.AccessKeyId)) throw new ArgumentException("AccessKeyId is required.");
       if (string.IsNullOrWhiteSpace(auth.SecretAccessKey)) throw new ArgumentException("SecretAccessKey is required.");
-      if (string.IsNullOrWhiteSpace(auth.Region))          throw new ArgumentException("Region is required.");
-      if (string.IsNullOrWhiteSpace(bucket))               throw new ArgumentException("bucketName is required.");
-      if (string.IsNullOrWhiteSpace(key))                  throw new ArgumentException("key is required.");
-      if (mins <= 0 || mins > 10080)                       throw new ArgumentOutOfRangeException(nameof(mins), "durationInMinutes must be 1–10080.");
+      if (string.IsNullOrWhiteSpace(auth.Region)) throw new ArgumentException("Region is required.");
+      if (string.IsNullOrWhiteSpace(bucket)) throw new ArgumentException("bucketName is required.");
+      if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("key is required.");
+      if (mins <= 0 || mins > 10080) throw new ArgumentOutOfRangeException(nameof(mins), "durationInMinutes must be 1–10080.");
     }
 
     private static AmazonS3Client CreateClient(S3AuthInfo auth)
