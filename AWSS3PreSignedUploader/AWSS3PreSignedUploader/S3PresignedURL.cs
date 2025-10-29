@@ -3,7 +3,7 @@ using OutSystems.ExternalLibraries.SDK;
 using Amazon;
 using Amazon.S3;
 using Amazon.S3.Model;
-// -------- Initial version of the Library --------
+// -------- Initial version of the Library - 1.3.3 --------
 namespace AWSS3PreSignedUploader
 {
   // -------- Data structures --------
